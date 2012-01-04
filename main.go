@@ -44,6 +44,7 @@ var (
 	rqs  uint64
 	ids  uint64
 	seq  int64
+	fs   *srv.Fsrv
 )
 
 type CtlFile struct {
@@ -54,7 +55,7 @@ type CtlFile struct {
 func (c *CtlFile) Read(fid *srv.FFid, buf []byte, offset uint64) (int, error) {
 	c.Lock()
 	defer c.Unlock()
-	
+
 	var b []byte
 
 	n := len(c.datafile)
@@ -74,7 +75,7 @@ func (c *CtlFile) Read(fid *srv.FFid, buf []byte, offset uint64) (int, error) {
 func (c *CtlFile) Write(fid *srv.FFid, data []byte, offset uint64) (int, error) {
 	c.Lock()
 	defer c.Unlock()
-	
+
 	n, err := strconv.Atoi(string(data))
 	if err != nil {
 		log.Fatalf("%s\n", err)
@@ -86,11 +87,11 @@ func (c *CtlFile) Write(fid *srv.FFid, data []byte, offset uint64) (int, error) 
 	}
 
 	now := time.Now()
-	
+
 	sm.Lock()
 	dfname := fmt.Sprintf("%d%d%d%d%d%d.%d", now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), now.Second(), rqs)
 	sm.Unlock()
-	
+
 	df := new(DataFile)
 	err = df.Add(c.File.Parent, dfname, p.OsUsers.Uid2User(os.Geteuid()), nil, 0777, df)
 	if err != nil {
@@ -130,6 +131,46 @@ func (c *CtlFile) Write(fid *srv.FFid, data []byte, offset uint64) (int, error) 
 	return len(data), nil
 }
 
+func (c *CtlFile) Wstat(fid *srv.FFid, dir *p.Dir) error {
+	var uid, gid uint32
+
+	c.Lock()
+	defer c.Unlock()
+
+	up := fs.Upool
+	uid = dir.Uidnum
+	gid = dir.Gidnum
+	if uid == p.NOUID && dir.Uid != "" {
+		user := up.Uname2User(dir.Uid)
+		if user == nil {
+			return srv.Enouser
+		}
+
+		c.Uidnum = uint32(user.Id())
+	}
+
+	if gid == p.NOUID && dir.Gid != "" {
+		group := up.Gname2Group(dir.Gid)
+		if group == nil {
+			return srv.Enouser
+		}
+
+		c.Gidnum = uint32(group.Id())
+	}
+
+	if dir.Mode != 0xFFFFFFFF {
+		c.Mode = (c.Mode &^ 0777) | (dir.Mode & 0777)
+	}
+
+	if dir.Name != "" {
+		if err := c.Rename(dir.Name); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
 type DataFile struct {
 	srv.File
 	uuids [][]byte
@@ -138,7 +179,7 @@ type DataFile struct {
 func (d *DataFile) Read(fid *srv.FFid, buf []byte, offset uint64) (int, error) {
 	d.Lock()
 	defer d.Unlock()
-	
+
 	if offset > d.Length {
 		return 0, nil
 	}
@@ -175,7 +216,7 @@ type Clone struct {
 func (k *Clone) Read(fid *srv.FFid, buf []byte, offset uint64) (int, error) {
 	k.Lock()
 	defer k.Unlock()
-	
+
 	var err error
 
 	// we only allow a single read from us, change the offset and we're done
@@ -218,7 +259,7 @@ type StatsFile struct {
 func (s *StatsFile) Read(fid *srv.FFid, buf []byte, offset uint64) (int, error) {
 	s.Lock()
 	defer s.Unlock()
-	
+
 	var b []byte
 
 	sm.Lock()
@@ -255,7 +296,7 @@ func parseFlags() {
 
 func mkroot() (*srv.File, error) {
 	root := new(srv.File)
-	err := root.Add(nil, "/", p.OsUsers.Uid2User(os.Geteuid()), nil, p.DMDIR|0555, nil)
+	err := root.Add(nil, "/", p.OsUsers.Uid2User(os.Geteuid()), p.OsUsers.Gid2Group(os.Getegid()), p.DMDIR|0555, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -265,7 +306,6 @@ func mkroot() (*srv.File, error) {
 func serve9p() {
 	var cl *Clone
 	var err error
-	var s *srv.Fsrv
 	var sf *StatsFile
 
 	root, err = mkroot()
@@ -285,11 +325,11 @@ func serve9p() {
 		goto error
 	}
 
-	s = srv.NewFileSrv(root)
-	s.Dotu = true
+	fs = srv.NewFileSrv(root)
+	fs.Dotu = true
 
-	s.Start(s)
-	err = s.StartNetListener("tcp", *laddr)
+	fs.Start(fs)
+	err = fs.StartNetListener("tcp", *laddr)
 	if err != nil {
 		goto error
 	}
